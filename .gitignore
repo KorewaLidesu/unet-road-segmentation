@@ -1,0 +1,14 @@
+# Map tiles / any local dataset copies (large binaries, not part of the repo)
+/tiles/
+/data/
+/checkpoints/
+*.ckpt
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Env
+.venv/
+venv/

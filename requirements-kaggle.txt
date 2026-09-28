@@ -1,0 +1,20 @@
+# Installed on top of the Kaggle GPU image, which already provides torch,
+# torchvision, numpy, opencv, scipy, scikit-image, networkx, matplotlib,
+# pillow, tqdm and pandas. Keep this list to what Kaggle is missing so a
+# session does not spend minutes resolving packages it already has.
+#
+#   pip install -q -r requirements-kaggle.txt
+#
+# NOT listed here, on purpose: mamba-ssm / causal-conv1d / VMamba's
+# selective_scan kernel. Those need a CUDA compile against the session's GPU;
+# the notebook handles them in its own step. See README "The CUDA kernel".
+
+pytorch-lightning>=2.3,<2.6
+mlflow>=2.16            # mlflow-skinny also works and installs faster
+addict                  # tools/cfg.py config objects
+ttach                   # test-time augmentation in road_seg_test.py
+sknw                    # graph extraction for the APLS metric
+timm>=1.0.15            # DropPath / trunc_normal_ / register_model
+albumentations>=1.4
+psutil                  # mlflow system metrics
+nvidia-ml-py            # mlflow GPU metrics

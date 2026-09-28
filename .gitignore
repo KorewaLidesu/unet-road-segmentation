@@ -2,7 +2,14 @@
 /tiles/
 /data/
 /checkpoints/
+/model_weights/
 *.ckpt
+
+# Experiment tracking + run outputs
+/mlruns/
+/lightning_logs/
+/results/
+mlflow_run.json
 
 # Python
 __pycache__/

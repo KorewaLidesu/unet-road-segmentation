@@ -1900,7 +1900,12 @@ class VSSBlock(nn.Module):
 
     def forward(self, input: torch.Tensor):
         if self.use_checkpoint:
-            return checkpoint.checkpoint(self._forward, input)
+            # kaggle: use_reentrant=False. Torch's default (True) re-enters the
+            # autograd engine during backward, which fires DDP's gradient hooks a
+            # second time for every parameter in this block -- "marked as ready
+            # twice", and the run dies on the first optimiser step of a multi-GPU
+            # job. The non-reentrant implementation is gradient-identical.
+            return checkpoint.checkpoint(self._forward, input, use_reentrant=False)
         else:
             return self._forward(input)
 

@@ -171,6 +171,11 @@ augmentations are unchanged. Everything else:
 - `selective_scan_cuda_oflex` was called but never imported — the `"oflex"` branch was
   dead code. Both kernels are now imported and `selective_scan_backend()` picks one, rather
   than dropping to the Python-loop fallback whenever `mamba-ssm` specifically was absent.
+- VMamba's gradient checkpointing called `checkpoint.checkpoint()` without
+  `use_reentrant`, so it took torch's reentrant default. That re-enters the autograd
+  engine during backward and fires DDP's gradient hooks twice per parameter, killing
+  any multi-GPU run on its first optimiser step with *"marked as ready twice"*. Now
+  `use_reentrant=False`, which is gradient-identical and DDP-safe.
 - `fvcore` is imported lazily; it is only used by `VSSM.flops()`, which training never calls.
 - `EdgeLoss`'s Laplacian kernel used `.cuda()`; now `.to(x.device)`, so CPU runs work.
 - `dpgb.path` reads `DEEPGLOBE_ROOT` instead of hard-coding `/root/autodl-tmp/data/DeepGlobe`.

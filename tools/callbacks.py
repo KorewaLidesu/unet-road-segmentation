@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import torch
 from pytorch_lightning.callbacks import Callback
@@ -49,6 +51,46 @@ def _hstack(panels: list[np.ndarray], pad: int = 4) -> np.ndarray:
     return np.concatenate(stacked, axis=1)
 
 
+def _hms(seconds: float) -> str:
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m{seconds:02d}s"
+
+
+class EpochTimer(Callback):
+    """Log each epoch's wall time as ``epoch_seconds`` and print an ETA.
+
+    In Lightning 2.x ``on_train_epoch_end`` fires after that epoch's validation,
+    so the time includes it, and the ETA -- the mean over the epochs this
+    session has run -- spreads the validation epochs' extra cost evenly.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._fit_start = self._epoch_start = None
+        self._first_epoch = 0
+
+    def on_train_start(self, trainer, pl_module):
+        self._fit_start = time.perf_counter()
+        self._first_epoch = trainer.current_epoch  # nonzero when resumed
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        self._epoch_start = time.perf_counter()
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if self._epoch_start is None or trainer.global_rank != 0:
+            return
+        now = time.perf_counter()
+        seconds = now - self._epoch_start
+        epoch = trainer.current_epoch + 1
+        mean = (now - self._fit_start) / max(1, epoch - self._first_epoch)
+        remaining = max(0, trainer.max_epochs - epoch) * mean
+        if trainer.logger is not None:
+            trainer.logger.log_metrics({"epoch_seconds": seconds}, step=trainer.global_step)
+        print(f"[speed] epoch {epoch}/{trainer.max_epochs} took {seconds:.1f}s, "
+              f"~{_hms(remaining)} to go", flush=True)
+
+
 class MLflowPredictionImages(Callback):
     """Log a few validation predictions to MLflow every N epochs.
 
@@ -75,9 +117,13 @@ class MLflowPredictionImages(Callback):
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
         if batch_idx != 0 or not self._active(trainer):
             return
-        imgs, masks = batch["img"], batch["gt_semantic_seg"]
-        preds = pl_module(imgs).argmax(dim=1)
-        for i in range(min(self.num_samples, imgs.shape[0])):
+        n = min(self.num_samples, batch["img"].shape[0])
+        imgs, masks = batch["img"][:n], batch["gt_semantic_seg"][:n]
+        # Hooks run outside Lightning's autocast; without this the previews would
+        # be a second, full-precision forward pass.
+        with trainer.precision_plugin.forward_context():
+            preds = pl_module(imgs).argmax(dim=1)
+        for i in range(n):
             gt = masks[i].cpu().numpy().astype(np.int64)
             pred = preds[i].cpu().numpy().astype(np.int64)
             self._rows.append(_hstack([

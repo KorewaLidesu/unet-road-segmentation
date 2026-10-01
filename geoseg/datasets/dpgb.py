@@ -10,6 +10,7 @@ import albumentations as albu
 import matplotlib.patches as mpatches
 from PIL import Image
 import random
+import re
 
 CLASSES = ('Road', 'Background')
 PALETTE = [[255, 255, 255],  [0, 0, 0]]
@@ -126,6 +127,89 @@ class DpgbDataset(Dataset):
         img = np.ascontiguousarray(img)
 
         return img, mask
+
+
+# albumentations' Normalize() defaults, so train and val/test inputs match.
+# Shaped (C, 1, 1) to broadcast over CHW.
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1) * 255.0
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1) * 255.0
+
+# tools/prepare_deepglobe.py names tiles <scene>_r<i>c<j>; --mode resize leaves bare <scene>.
+_TILE_SUFFIX = re.compile(r'_r\d+c\d+$')
+
+
+class DpgbSceneCropDataset(Dataset):
+    """Training set where one epoch is one random ``crop_size`` window per scene.
+
+    Indexing scenes rather than tiles keeps an epoch at one sample per DeepGlobe
+    scene whatever the crop size, which is what makes a 300-epoch schedule
+    affordable. The window is cut from a random one of the scene's 512 tiles,
+    so each sample decodes a quarter of the 1024 original.
+
+    Augmentation is ``get_training_transform()`` below -- flips, 90-degree
+    rotations, brightness/contrast, same probabilities and limits -- written out
+    with ``random``, which PyTorch reseeds in every DataLoader worker.
+    """
+
+    def __init__(self, data_root=path, img_dir='train_images', mask_dir='train_masks',
+                 img_suffix='.jpg', mask_suffix='.png', crop_size=256):
+        self.data_root = data_root
+        self.img_dir = img_dir
+        self.mask_dir = mask_dir
+        self.img_suffix = img_suffix
+        self.mask_suffix = mask_suffix
+        self.crop_size = crop_size
+
+        scenes = {}
+        for name in sorted(os.listdir(osp.join(data_root, mask_dir))):
+            tile_id = osp.splitext(name)[0]
+            scenes.setdefault(_TILE_SUFFIX.sub('', tile_id), []).append(tile_id)
+        assert scenes, f'no masks in {osp.join(data_root, mask_dir)}'
+        self.scenes = list(scenes.values())
+
+        tile = cv2.imread(osp.join(data_root, mask_dir, self.scenes[0][0] + mask_suffix),
+                          cv2.IMREAD_UNCHANGED)
+        assert crop_size <= min(tile.shape[:2]), (
+            f'crop_size {crop_size} is larger than the {tile.shape[1]}x{tile.shape[0]} '
+            f'prepared tiles')
+
+    def __len__(self):
+        return len(self.scenes)
+
+    def __getitem__(self, index):
+        tile_id = random.choice(self.scenes[index])
+        # BGR; the channel flip to RGB rides along with the CHW copy below.
+        img = cv2.imread(osp.join(self.data_root, self.img_dir, tile_id + self.img_suffix),
+                         cv2.IMREAD_COLOR)
+        mask = cv2.imread(osp.join(self.data_root, self.mask_dir, tile_id + self.mask_suffix),
+                          cv2.IMREAD_UNCHANGED)
+
+        size = self.crop_size
+        top = random.randint(0, mask.shape[0] - size)
+        left = random.randint(0, mask.shape[1] - size)
+        img = img[top:top + size, left:left + size]
+        mask = mask[top:top + size, left:left + size]
+
+        if random.random() < 0.5:
+            img, mask = img[:, ::-1], mask[:, ::-1]
+        if random.random() < 0.5:
+            img, mask = img[::-1], mask[::-1]
+        if random.random() < 0.5:
+            k = random.randint(0, 3)
+            img, mask = np.rot90(img, k), np.rot90(mask, k)
+
+        # One copy does the RGB flip, HWC -> CHW and float conversion; the rest is
+        # in place, since this runs for every sample on a 4-vCPU Kaggle box.
+        img = np.ascontiguousarray(img[:, :, ::-1].transpose(2, 0, 1), dtype=np.float32)
+        if random.random() < 0.5:
+            img *= 1.0 + random.uniform(-0.2, 0.2)     # contrast
+            img += 255.0 * random.uniform(-0.2, 0.2)   # brightness
+            np.clip(img, 0.0, 255.0, out=img)
+        img -= IMAGENET_MEAN
+        img /= IMAGENET_STD
+
+        mask = torch.from_numpy(np.ascontiguousarray(mask)).long()
+        return dict(img_id=tile_id, img=torch.from_numpy(img), gt_semantic_seg=mask)
 
 
 def get_training_transform():

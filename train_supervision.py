@@ -1,26 +1,23 @@
-"""RFM-UNet supervised training.
+"""Supervised training for the road segmentation configs.
 
-Upstream (GeoSeg / RFMUNet) logged to a CSV file and assumed a 24GB+ Ampere box.
-This version keeps the same training maths but logs to MLflow and adds the knobs
-a Kaggle session needs: mixed precision, gradient accumulation, a wall-clock
-stop, automatic resume, and DDP-correct epoch metrics.
+GeoSeg's Lightning training loop, logging to MLflow instead of a CSV file, with
+the knobs a Kaggle session needs: mixed precision, channels_last, a wall-clock
+stop, automatic resume, and DDP-correct epoch metrics accumulated on the GPU.
 
-    python train_supervision.py -c config/kaggle/RFMUNet.py
+    python train_supervision.py -c config/kaggle/ResNet34UNet.py
 """
 
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, Timer
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, Timer, TQDMProgressBar
 from tools.cfg import py2cfg
 import os
 import torch
-from torch import nn
-import cv2
 import numpy as np
 import argparse
 from pathlib import Path
 from tools.metric import Evaluator
 from tools import mlflow_utils
-from tools.callbacks import MLflowPredictionImages
+from tools.callbacks import EpochTimer, MLflowPredictionImages
 import random
 import warnings
 
@@ -34,14 +31,24 @@ torch.set_float32_matmul_precision('high')
 FOREGROUND_ONLY_DATASETS = ('vaihingen', 'potsdam', 'whu', 'mass', 'inria')
 
 
-def seed_everything(seed):
+def seed_everything(seed, deterministic=False):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
+
+
+def resolve_channels_last(setting) -> bool:
+    """'auto' means NHWC on tensor-core GPUs (compute >= 7.0) and NCHW elsewhere."""
+    setting = str(setting).strip().lower()
+    if setting in ('0', 'false', 'no', 'off') or not torch.cuda.is_available():
+        return False
+    if setting == 'auto':
+        return torch.cuda.get_device_capability(0)[0] >= 7
+    return True
 
 
 def get_args():
@@ -56,36 +63,41 @@ class Supervision_Train(pl.LightningModule):
         super().__init__()
         self.config = config
         self.net = config.net
+        self.num_classes = config.num_classes
 
         self.loss = config.loss
+
+        self.channels_last = resolve_channels_last(config.get('channels_last', 'auto'))
+        if self.channels_last:
+            self.net = self.net.to(memory_format=torch.channels_last)
+
+        # Confusion matrices live on the GPU and reach the host once per epoch;
+        # copying every predicted mask to numpy stalled each training step.
+        nc = self.num_classes
+        self.register_buffer('cm_train', torch.zeros(nc, nc, dtype=torch.long), persistent=False)
+        self.register_buffer('cm_val', torch.zeros(nc, nc, dtype=torch.long), persistent=False)
 
         # Topology metrics (clDice / APLS) skeletonise every image on the CPU and
         # build two graphs per image. That is affordable at test time, not inside
         # a training loop, so each split gets its own switch.
-        self.metrics_train = Evaluator(num_class=config.num_classes,
-                                       topology=bool(config.get('train_topology_metrics', False)))
-        self.metrics_val = Evaluator(num_class=config.num_classes,
-                                     topology=bool(config.get('val_topology_metrics', False)))
+        self.metrics = {
+            'train': Evaluator(num_class=nc, topology=bool(config.get('train_topology_metrics', False))),
+            'val': Evaluator(num_class=nc, topology=bool(config.get('val_topology_metrics', False))),
+        }
 
     def forward(self, x):
         # only net is used in the prediction/inference
-        seg_pre = self.net(x)
-        return seg_pre
+        if self.channels_last:
+            x = x.contiguous(memory_format=torch.channels_last)
+        # Hand back NCHW logits: DiceLoss .view()s them, which an NHWC tensor refuses.
+        return self.net(x).contiguous()
 
     def training_step(self, batch, batch_idx):
         img, mask = batch['img'], batch['gt_semantic_seg']
 
-        prediction = self.net(img)
+        prediction = self(img)
         loss = self.loss(prediction, mask)
-
-        if self.config.use_aux_loss:
-            pre_mask = nn.Softmax(dim=1)(prediction[0])
-        else:
-            pre_mask = nn.Softmax(dim=1)(prediction)
-
-        pre_mask = pre_mask.argmax(dim=1)
-        for i in range(mask.shape[0]):
-            self.metrics_train.add_batch(mask[i].cpu().numpy(), pre_mask[i].cpu().numpy())
+        self._update_metrics('train', prediction, mask)
 
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         return {"loss": loss}
@@ -94,15 +106,31 @@ class Supervision_Train(pl.LightningModule):
     # metric aggregation
     # ------------------------------------------------------------------ #
 
-    def _merge_across_ranks(self, evaluator):
-        """Confusion matrices and topology accumulators, summed over DDP ranks.
+    @torch.no_grad()
+    def _update_metrics(self, stage, prediction, mask):
+        pred = prediction.argmax(dim=1)
+        cm = getattr(self, f'cm_{stage}')
+        # One masked count per cell: no bincount, so no host sync per batch.
+        for true_class in range(self.num_classes):
+            is_true = mask == true_class
+            for pred_class in range(self.num_classes):
+                cm[true_class, pred_class] += (is_true & (pred == pred_class)).sum()
+
+        evaluator = self.metrics[stage]
+        if evaluator.topology:
+            for gt_i, pred_i in zip(mask.cpu().numpy(), pred.cpu().numpy()):
+                evaluator.add_batch(gt_i, pred_i)
+
+    def _merge_across_ranks(self, stage):
+        """Confusion matrix and topology accumulators, summed over DDP ranks.
 
         Without this each rank reports metrics over its own shard, which makes
         multi-GPU numbers quietly disagree with single-GPU ones.
         """
         world_size = self.trainer.world_size if self.trainer is not None else 1
+        evaluator = self.metrics[stage]
 
-        cm = torch.as_tensor(evaluator.confusion_matrix(), device=self.device, dtype=torch.float64)
+        cm = getattr(self, f'cm_{stage}').to(torch.float64)
         extras = torch.tensor([
             evaluator.cldice_tprec_num, evaluator.cldice_tprec_den,
             evaluator.cldice_trec_num, evaluator.cldice_trec_den,
@@ -123,9 +151,9 @@ class Supervision_Train(pl.LightningModule):
             merged.apls_scores = [extras[4] / extras[5]]
         return merged
 
-    def _epoch_metrics(self, evaluator, stage):
+    def _epoch_metrics(self, stage):
         """Reproduces upstream's per-dataset averaging, plus per-class values."""
-        merged = self._merge_across_ranks(evaluator)
+        merged = self._merge_across_ranks(stage)
         iou_per_class = merged.Intersection_over_Union()
         f1_per_class = merged.F1()
 
@@ -141,12 +169,12 @@ class Supervision_Train(pl.LightningModule):
         eval_value = {'mIoU': float(np.round(mIoU, 6)),
                       'F1': float(np.round(F1, 6)),
                       'OA': float(np.round(OA, 6))}
-        print(f'{stage}:', eval_value)
+        self.print(f'{stage}:', eval_value)
 
         iou_value = {}
         for class_name, iou in zip(self.config.classes, iou_per_class):
             iou_value[class_name] = np.round(iou, 6)
-        print(iou_value)
+        self.print(iou_value)
 
         log_dict = {f'{stage}_mIoU': mIoU, f'{stage}_F1': F1, f'{stage}_OA': OA}
         # Per-class metrics matter here: with two classes, mIoU is dominated by
@@ -156,35 +184,33 @@ class Supervision_Train(pl.LightningModule):
             log_dict[f'{stage}_F1_{class_name}'] = float(f1)
         if merged.topology:
             cldice, apls = merged.clDice(), merged.APLS()
-            print(f'{stage} topology: clDice={cldice:.6f} APLS={apls:.6f}')
+            self.print(f'{stage} topology: clDice={cldice:.6f} APLS={apls:.6f}')
             log_dict[f'{stage}_clDice'] = float(cldice)
             log_dict[f'{stage}_APLS'] = float(apls)
 
-        evaluator.reset()
+        getattr(self, f'cm_{stage}').zero_()
+        self.metrics[stage].reset()
         return log_dict
 
     def on_train_epoch_end(self):
-        log_dict = self._epoch_metrics(self.metrics_train, 'train')
+        log_dict = self._epoch_metrics('train')
         # Values are already reduced across ranks, so every rank logs the same
         # numbers -- ModelCheckpoint under DDP needs the monitored key present.
         self.log_dict(log_dict, prog_bar=True)
 
     def validation_step(self, batch, batch_idx):
         img, mask = batch['img'], batch['gt_semantic_seg']
-        prediction = self.forward(img)
-        pre_mask = nn.Softmax(dim=1)(prediction)
-        pre_mask = pre_mask.argmax(dim=1)
-        for i in range(mask.shape[0]):
-            self.metrics_val.add_batch(mask[i].cpu().numpy(), pre_mask[i].cpu().numpy())
+        prediction = self(img)
+        self._update_metrics('val', prediction, mask)
 
         loss_val = self.loss(prediction, mask)
         self.log('val_loss', loss_val, on_epoch=True, prog_bar=True, sync_dist=True)
         return {"loss_val": loss_val}
 
     def on_validation_epoch_end(self):
-        print(" ")
-        log_dict = self._epoch_metrics(self.metrics_val, 'val')
-        print("======================")
+        self.print(" ")
+        log_dict = self._epoch_metrics('val')
+        self.print("======================")
         # Values are already reduced across ranks, so every rank logs the same
         # numbers -- ModelCheckpoint under DDP needs the monitored key present.
         self.log_dict(log_dict, prog_bar=True)
@@ -192,8 +218,14 @@ class Supervision_Train(pl.LightningModule):
     def configure_optimizers(self):
         optimizer = self.config.optimizer
         lr_scheduler = self.config.lr_scheduler
+        if callable(lr_scheduler):
+            # A factory: OneCycleLR needs the run's total optimiser steps, which
+            # depend on the GPU count, batch size and limit_train_batches.
+            lr_scheduler = lr_scheduler(optimizer, int(self.trainer.estimated_stepping_batches))
 
-        return [optimizer], [lr_scheduler]
+        return {'optimizer': optimizer,
+                'lr_scheduler': {'scheduler': lr_scheduler,
+                                 'interval': self.config.get('lr_scheduler_interval', 'epoch')}}
 
     def train_dataloader(self):
 
@@ -221,7 +253,7 @@ def resolve_resume_path(config):
 def main():
     args = get_args()
     config = py2cfg(args.config_path)
-    seed_everything(config.get('seed', 42))
+    seed_everything(config.get('seed', 42), config.get('deterministic', False))
 
     Path(config.weights_path).mkdir(parents=True, exist_ok=True)
 
@@ -231,7 +263,11 @@ def main():
                                         mode=config.monitor_mode,
                                         dirpath=config.weights_path,
                                         filename=config.weights_name)
-    callbacks = [checkpoint_callback, LearningRateMonitor(logging_interval='epoch')]
+    callbacks = [checkpoint_callback, LearningRateMonitor(logging_interval='epoch'), EpochTimer()]
+
+    refresh_rate = config.get('progress_bar_refresh_rate', 1)
+    if refresh_rate > 0:
+        callbacks.append(TQDMProgressBar(refresh_rate=refresh_rate))
 
     # Kaggle kills the session on a hard wall clock. Stopping a little early
     # leaves time for the final checkpoint write and the MLflow flush, and
@@ -246,12 +282,13 @@ def main():
             every_n_epochs=config.get('prediction_image_every_n_epochs', 5),
         ))
 
+    model_name = config.get('model_name', config.weights_name)
     logger = mlflow_utils.build_logger(
-        experiment_name=config.get('experiment_name', 'RFMUNet'),
+        experiment_name=config.get('experiment_name', model_name),
         run_name=config.get('run_name', config.weights_name),
         default_store_dir=config.get('mlflow_default_dir', 'mlruns'),
         state_dir=config.weights_path,
-        tags={'dataset': config.get('dataset_name', 'unknown'), 'model': 'RFMUNet'},
+        tags={'dataset': config.get('dataset_name', 'unknown'), 'model': model_name},
         resume=config.get('auto_resume', True),
         log_model=config.get('mlflow_log_model', False),
     )
@@ -266,6 +303,7 @@ def main():
         **mlflow_utils.config_params(config),
         **mlflow_utils.env_params(),
         **mlflow_utils.model_params(model.net),
+        'env/channels_last': model.channels_last,
     })
     mlflow_utils.log_artifact(logger, args.config_path, 'config')
 
@@ -282,6 +320,7 @@ def main():
                         num_sanity_val_steps=config.get('num_sanity_val_steps', 2),
                         limit_train_batches=config.get('limit_train_batches', 1.0),
                         limit_val_batches=config.get('limit_val_batches', 1.0),
+                        enable_progress_bar=refresh_rate > 0,
                         logger=logger)
 
     status = 'FINISHED'
@@ -301,9 +340,11 @@ def main():
         mlflow_utils.log_dict(logger, summary, 'training_summary.json')
         stopped_early = status == 'FINISHED' and trainer.current_epoch < config.max_epoch
         if stopped_early:
-            # The wall-clock Timer stopped us. Leave the MLflow run open so the
-            # next Kaggle session resumes into it instead of opening a second one.
+            # The wall-clock Timer stopped us. Reopen the MLflow run (Lightning
+            # has just closed it) so the next Kaggle session resumes into it
+            # instead of opening a second one.
             status = 'RUNNING (resumable)'
+            mlflow_utils.set_resumable(logger)
             print(f'[train] stopped at epoch {trainer.current_epoch}/{config.max_epoch}; '
                   f'rerun to continue from last.ckpt')
         else:

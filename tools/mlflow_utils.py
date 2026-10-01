@@ -1,4 +1,4 @@
-"""MLflow plumbing for RFM-UNet training on Kaggle.
+"""MLflow plumbing for road segmentation training on Kaggle.
 
 Design goals:
 
@@ -33,6 +33,11 @@ SECRET_ENV_VARS = (
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
 )
+
+# Recent MLflow (3.16 here) refuses a local file store unless opted in, and pip on
+# Kaggle installs the latest. Set at import, before any client exists, so every
+# entry point and the DDP ranks they spawn inherit it. Remote servers ignore it.
+os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
 
 def _rank() -> int:
@@ -142,6 +147,8 @@ def env_params() -> dict[str, Any]:
         "env/torch": torch.__version__,
         "env/cuda": torch.version.cuda,
         "env/gpu_count": torch.cuda.device_count(),
+        # DataLoader decoding competes for these; it explains a slow epoch on a busy box.
+        "env/cpu_count": os.cpu_count(),
     }
     if torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability(0)
@@ -151,26 +158,14 @@ def env_params() -> dict[str, Any]:
             torch.cuda.get_device_properties(0).total_memory / 1024 ** 3, 1
         )
 
-    # Which selective-scan path the SSM blocks actually take. Worth recording on
-    # every run: the torch fallback is ~2 orders of magnitude slower, so a run that
-    # silently landed on it looks like a hardware problem rather than a missing wheel.
-    try:
-        from geoseg.models.ADAMamba import selective_scan_backend
-        params["env/selective_scan"] = selective_scan_backend()
-    except Exception:
-        params["env/selective_scan"] = "unknown"
-    try:
-        import triton  # noqa: F401
-        params["env/triton"] = triton.__version__
-    except Exception:
-        params["env/triton"] = "unavailable"
-
     sha = _git_sha(Path(__file__).resolve().parent.parent)
     if sha:
         params["env/git_sha"] = sha
-    upstream = Path(__file__).resolve().parent.parent / ".rfmunet-upstream-sha"
-    if upstream.exists():
-        params["env/rfmunet_upstream_sha"] = upstream.read_text().strip()[:12]
+    try:
+        from geoseg.models.resnet34_unet import upstream_sha
+        params["env/resnet34_unet_sha"] = (upstream_sha() or "unknown")[:12]
+    except Exception:
+        params["env/resnet34_unet_sha"] = "unknown"
     return params
 
 
@@ -355,6 +350,21 @@ def log_image(logger, image, artifact_file: str) -> None:
         logger.experiment.log_image(logger.run_id, image, artifact_file)
     except Exception as exc:
         print(f"[mlflow] could not log image {artifact_file}: {exc}")
+
+
+def set_resumable(logger) -> None:
+    """Reopen a run that stopped before its last epoch.
+
+    Lightning's ``MLFlowLogger.finalize()`` marks the run FINISHED at the end of
+    every ``fit()``, a wall-clock stop included, and ``build_logger`` will not
+    resume a finished run. Back to RUNNING, the next session continues it.
+    """
+    if not is_rank_zero():
+        return
+    try:
+        logger.experiment.update_run(logger.run_id, status="RUNNING")
+    except Exception as exc:
+        print(f"[mlflow] could not reopen run for resuming: {exc}")
 
 
 def set_terminated(logger, status: str = "FINISHED") -> None:

@@ -1,6 +1,6 @@
-"""Evaluate a trained RFM-UNet checkpoint and write its predicted masks.
+"""Evaluate a trained checkpoint and write its predicted masks.
 
-    python road_seg_test.py -c config/kaggle/RFMUNet.py -o /kaggle/working/results --rgb -t lr
+    python road_seg_test.py -c config/kaggle/ResNet34UNet.py -o /kaggle/working/results --rgb -t lr
 
 Changes from upstream, all for Kaggle:
 
@@ -12,6 +12,7 @@ Changes from upstream, all for Kaggle:
 * clDice and APLS are computed here (they are too slow to run every epoch).
 """
 
+import contextlib
 import ttach as tta
 import multiprocessing as mp
 from multiprocessing.pool import ThreadPool
@@ -105,8 +106,8 @@ def log_to_mlflow(config, metrics: dict, extra_params: dict) -> None:
         if run_id:
             mlflow.start_run(run_id=run_id)
         else:
-            mlflow.set_experiment(config.get('experiment_name', 'RFMUNet'))
-            mlflow.start_run(run_name=f"{config.get('run_name', 'RFMUNet')}-test")
+            mlflow.set_experiment(config.get('experiment_name', config.weights_name))
+            mlflow.start_run(run_name=f"{config.get('run_name', config.weights_name)}-test")
         mlflow.set_tags({'evaluated': 'true', **{f'test/{k}': v for k, v in extra_params.items()}})
         mlflow.log_metrics(metrics)
         print(f'[test] logged {len(metrics)} metrics to run {mlflow.active_run().info.run_id}')
@@ -153,6 +154,13 @@ def main():
 
     test_dataset = config.test_dataset
 
+    # Score in the precision the model was trained and validated in: on a T4,
+    # fp16 runs on the tensor cores and fp32 does not.
+    amp_dtype = {'16-mixed': torch.float16, 'bf16-mixed': torch.bfloat16}.get(str(config.get('precision')))
+    autocast = (torch.autocast('cuda', dtype=amp_dtype) if amp_dtype and device.type == 'cuda'
+                else contextlib.nullcontext())
+    torch.backends.cudnn.benchmark = not config.get('deterministic', False)
+
     write_pool = ThreadPool(processes=max(2, mp.cpu_count()))
     pending = []
     write_time = 0.0
@@ -166,7 +174,8 @@ def main():
             drop_last=False,
         )
         for input in tqdm(test_loader):
-            raw_predictions = model(input['img'].to(device))
+            with autocast:
+                raw_predictions = model(input['img'].to(device))
             image_ids = input["img_id"]
             masks_true = input.get('gt_semantic_seg')
 

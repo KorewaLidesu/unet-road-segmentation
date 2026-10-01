@@ -1,0 +1,5 @@
+[submodule "third_party/resnet34-unet"]
+	path = third_party/resnet34-unet
+	url = https://github.com/GohVh/resnet34-unet
+	shallow = true
+	ignore = untracked

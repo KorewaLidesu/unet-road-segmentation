@@ -1,4 +1,4 @@
-"""Turn the Kaggle DeepGlobe Road Extraction dataset into the layout RFM-UNet wants.
+"""Turn the Kaggle DeepGlobe Road Extraction dataset into the layout training wants.
 
     python tools/prepare_deepglobe.py \
         --src /kaggle/input/deepglobe-road-extraction-dataset \
@@ -17,10 +17,11 @@ Two things have to happen and both are easy to get wrong:
    0/255 mask to training instead would be silently catastrophic: every road
    pixel would be read as ``ignore_index=255``.
 
-Source images are 1024x1024 and the model trains at 512x512, so each image
-becomes four non-overlapping 512 tiles by default (``--mode split``), preserving
-the native resolution of thin roads. ``--mode resize`` halves them instead:
-4x less data and 4x faster epochs, at the cost of one-pixel roads.
+Source images are 1024x1024. Each becomes four non-overlapping 512 tiles by
+default (``--mode split``), preserving the native resolution of thin roads:
+validation and testing score every tile, and training cuts its random crops
+out of them. ``--mode resize`` halves each image to one 512 tile instead: 4x
+less to validate and test, at the cost of one-pixel roads.
 """
 
 from __future__ import annotations
